@@ -40,9 +40,18 @@ def _generate_default_integrations_iterator(
             try:
                 module, cls = import_string.rsplit(".", 1)
                 yield getattr(import_module(module), cls)
-            except (DidNotEnable, SyntaxError) as e:
+            except DidNotEnable as e:
                 logger.debug(
                     "Did not import default integration %s: %s", import_string, e
+                )
+            except Exception:
+                # A broken integration module (e.g. the framework changed its
+                # API) must not prevent the SDK or the other integrations
+                # from being set up.
+                logger.warning(
+                    "Failed to import integration %s. The SDK itself is not affected.",
+                    import_string,
+                    exc_info=True,
                 )
 
     if isinstance(iter_default_integrations.__doc__, str):
@@ -198,6 +207,16 @@ def setup_integrations(
     Users can override this behavior by:
       - Explicitly providing an integration in the `integrations=[]` list, or
       - Disabling the higher-level integration via the `disabled_integrations` option.
+
+    Setup is idempotent: each integration is set up at most once per process,
+    keyed by its `identifier`. Repeated calls (e.g. several modules each
+    initializing the SDK, or a framework hot-reload re-importing integration
+    modules) neither re-apply monkeypatches nor overwrite already installed
+    integrations.
+
+    Setup is also fault-isolated: an integration that fails to install is
+    skipped and logged (with its identifier) at warning level, without
+    affecting the other integrations or the rest of the SDK.
     """
     integrations = dict(
         (integration.identifier, integration) for integration in integrations or ()
@@ -249,26 +268,45 @@ def setup_integrations(
     for identifier, integration in integrations.items():
         with _installer_lock:
             if identifier not in _processed_integrations:
+                # Mark the integration as processed up front: whatever happens
+                # during setup, it is never attempted again. Retrying a
+                # half-failed setup could apply monkeypatches twice, and
+                # repeated init() calls (multiple modules initializing the
+                # SDK, framework hot-reloads) must not re-patch.
+                _processed_integrations.add(identifier)
+
                 if type(integration) in disabled_integrations:
                     logger.debug("Ignoring integration %s", identifier)
-                else:
-                    logger.debug(
-                        "Setting up previously not enabled integration %s", identifier
-                    )
-                    try:
-                        type(integration).setup_once()
-                        integration.setup_once_with_options(options)
-                    except DidNotEnable as e:
-                        if identifier not in used_as_default_integration:
-                            raise
+                    continue
 
+                logger.debug(
+                    "Setting up previously not enabled integration %s", identifier
+                )
+                try:
+                    type(integration).setup_once()
+                    integration.setup_once_with_options(options)
+                except DidNotEnable as e:
+                    if identifier in used_as_default_integration:
                         logger.debug(
                             "Did not enable default integration %s: %s", identifier, e
                         )
                     else:
-                        _installed_integrations.add(identifier)
-
-                _processed_integrations.add(identifier)
+                        # The user explicitly asked for this integration, so
+                        # make the failure visible instead of silently
+                        # swallowing it. Still don't abort the SDK init.
+                        logger.warning(
+                            "Did not enable integration %s: %s", identifier, e
+                        )
+                except Exception:
+                    # A failing integration must not take down the rest of
+                    # the SDK. Name it so it can be told apart from the others.
+                    logger.warning(
+                        "Failed to set up integration %s. The SDK itself is not affected.",
+                        identifier,
+                        exc_info=True,
+                    )
+                else:
+                    _installed_integrations.add(identifier)
 
     integrations = {
         identifier: integration
@@ -307,8 +345,10 @@ class DidNotEnable(Exception):  # noqa: N818
     The integration could not be enabled due to a trivial user error like
     `flask` not being installed for the `FlaskIntegration`.
 
-    This exception is silently swallowed for default integrations, but reraised
-    for explicitly enabled integrations.
+    This exception is logged at debug level for default and auto-enabling
+    integrations, and at warning level for explicitly enabled ones. It is
+    never propagated out of `setup_integrations`: a failing integration must
+    not take down the rest of the SDK.
     """
 
 

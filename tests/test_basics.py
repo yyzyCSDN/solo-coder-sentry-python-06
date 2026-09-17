@@ -984,6 +984,120 @@ def test_multiple_setup_integrations_calls():
     assert second_call_return == {NoOpIntegration.identifier: NoOpIntegration()}
 
 
+def _make_setup_counting_integration(identifier, error=None):
+    """Build an Integration subclass recording how often setup_once ran."""
+
+    class _CountingIntegration(Integration):
+        setup_once_call_count = 0
+
+        @staticmethod
+        def setup_once():
+            _CountingIntegration.setup_once_call_count += 1
+            if error is not None:
+                raise error
+
+    _CountingIntegration.identifier = identifier
+    return _CountingIntegration
+
+
+def test_setup_integrations_patches_only_once():
+    # Repeated setup (multiple modules initializing the SDK, hot reloads)
+    # must not re-apply monkeypatches.
+    integration_cls = _make_setup_counting_integration("_test_patch_once")
+
+    for _ in range(3):
+        result = setup_integrations([integration_cls()], with_defaults=False)
+        assert list(result) == [integration_cls.identifier]
+
+    assert integration_cls.setup_once_call_count == 1
+
+
+def test_setup_integrations_failure_does_not_break_others():
+    crashing_cls = _make_setup_counting_integration(
+        "_test_crashing", error=RuntimeError("boom")
+    )
+    healthy_cls = _make_setup_counting_integration("_test_healthy")
+
+    result = setup_integrations([crashing_cls(), healthy_cls()], with_defaults=False)
+
+    assert list(result) == [healthy_cls.identifier]
+    assert healthy_cls.setup_once_call_count == 1
+
+
+def test_setup_integrations_failure_is_not_retried():
+    # A failed setup may have left a half-applied monkeypatch behind, so a
+    # later init() must not attempt the same integration again.
+    crashing_cls = _make_setup_counting_integration(
+        "_test_crashing_no_retry", error=RuntimeError("boom")
+    )
+
+    for _ in range(2):
+        result = setup_integrations([crashing_cls()], with_defaults=False)
+        assert result == {}
+
+    assert crashing_cls.setup_once_call_count == 1
+
+
+def test_setup_integrations_failure_logs_identifier(sentry_init, caplog):
+    crashing_cls = _make_setup_counting_integration(
+        "_test_crashing_logged", error=RuntimeError("boom")
+    )
+
+    # SDK logs are only emitted with debug=True (sentry_sdk.errors is gated
+    # behind the debug option), so enable it to observe the failure.
+    with caplog.at_level(logging.WARNING, logger="sentry_sdk.errors"):
+        sentry_init(
+            integrations=[crashing_cls()],
+            default_integrations=False,
+            auto_enabling_integrations=False,
+            debug=True,
+        )
+
+    (record,) = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert "_test_crashing_logged" in record.getMessage()
+
+
+def test_setup_integrations_explicit_did_not_enable_does_not_raise(sentry_init, caplog):
+    # DidNotEnable from an explicitly provided integration used to abort the
+    # whole SDK init. It now surfaces as a warning naming the integration.
+    refusing_cls = _make_setup_counting_integration(
+        "_test_refusing", error=DidNotEnable("not supported here")
+    )
+
+    with caplog.at_level(logging.WARNING, logger="sentry_sdk.errors"):
+        sentry_init(
+            integrations=[refusing_cls()],
+            default_integrations=False,
+            auto_enabling_integrations=False,
+            debug=True,
+        )
+
+    assert refusing_cls.identifier not in get_client().integrations
+    (record,) = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    message = record.getMessage()
+    assert "_test_refusing" in message
+    assert "not supported here" in message
+
+
+def test_sentry_init_survives_failing_integration(sentry_init, capture_events):
+    crashing_cls = _make_setup_counting_integration(
+        "_test_crashing_on_init", error=RuntimeError("boom")
+    )
+
+    sentry_init(
+        integrations=[crashing_cls()],
+        default_integrations=False,
+        auto_enabling_integrations=False,
+    )
+
+    assert crashing_cls.identifier not in get_client().integrations
+
+    events = capture_events()
+    capture_message("SDK still works")
+    (event,) = events
+    assert event["message"] == "SDK still works"
+
+
 class TracingTestClass:
     @staticmethod
     def static(arg):
