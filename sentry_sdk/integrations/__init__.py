@@ -1,3 +1,4 @@
+import warnings
 from abc import ABC, abstractmethod
 from threading import Lock
 from typing import TYPE_CHECKING
@@ -14,11 +15,22 @@ _DEFAULT_FAILED_REQUEST_STATUS_CODES = frozenset(range(500, 600))
 
 _installer_lock = Lock()
 
-# Set of all integration identifiers we have attempted to install
+_INSTALLATION_STATUS_INSTALLED = "installed"
+_INSTALLATION_STATUS_FAILED = "failed"
+
+# Map of integration identifiers to their installation state. This is the source
+# of truth for process-global integration installation state.
+_integrations_status: "Dict[str, str]" = {}
+
+# Backwards-compatible aliases. These are kept in sync with
+# ``_integrations_status`` because tests and external integrations access them.
 _processed_integrations: "Set[str]" = set()
 
 # Set of all integration identifiers we have actually installed
 _installed_integrations: "Set[str]" = set()
+
+# Map of integration identifiers to their most recent installation error.
+_failed_integrations: "Dict[str, BaseException]" = {}
 
 
 def _generate_default_integrations_iterator(
@@ -40,10 +52,26 @@ def _generate_default_integrations_iterator(
             try:
                 module, cls = import_string.rsplit(".", 1)
                 yield getattr(import_module(module), cls)
-            except (DidNotEnable, SyntaxError) as e:
+            except Exception as e:
                 logger.debug(
                     "Did not import default integration %s: %s", import_string, e
                 )
+                if not isinstance(e, DidNotEnable):
+                    # Unlike a missing optional dependency, an unexpected error
+                    # can indicate a broken integration. Log it at warning
+                    # level with the exact integration import string.
+                    logger.warning(
+                        "Did not import auto-enabling integration %s due to an "
+                        "error: %s",
+                        import_string,
+                        e,
+                        exc_info=True,
+                    )
+                    message = (
+                        "Did not import auto-enabling integration %s "
+                        "due to an error: %s" % (import_string, e)
+                    )
+                    warnings.warn(message, IntegrationWarning, stacklevel=3)
 
     if isinstance(iter_default_integrations.__doc__, str):
         for import_string in integrations:
@@ -174,6 +202,42 @@ _INTEGRATION_DEACTIVATES = {
 }
 
 
+def _set_integration_status(identifier: str, status: str) -> None:
+    _integrations_status[identifier] = status
+    _processed_integrations.add(identifier)
+
+    if status == _INSTALLATION_STATUS_INSTALLED:
+        _installed_integrations.add(identifier)
+        _failed_integrations.pop(identifier, None)
+    elif status == _INSTALLATION_STATUS_FAILED:
+        _installed_integrations.discard(identifier)
+
+
+def _report_integration_failure(
+    identifier: str,
+    error: "BaseException",
+    default_integration: bool,
+    warning_stacklevel: int = 3,
+) -> None:
+    if isinstance(error, DidNotEnable):
+        if default_integration:
+            logger.debug("Did not enable default integration %s: %s", identifier, error)
+        else:
+            message = "Did not enable %s integration: %s" % (identifier, error)
+            logger.debug(message)
+            warnings.warn(message, IntegrationWarning, stacklevel=warning_stacklevel)
+    else:
+        # A buggy integration must never prevent the SDK (or any other
+        # integration) from initializing. Keep the identifier in the message
+        # and warning to make the failing integration easy to identify.
+        message = "Did not enable %s integration due to an error: %s" % (
+            identifier,
+            error,
+        )
+        logger.warning(message, exc_info=True)
+        warnings.warn(message, IntegrationWarning, stacklevel=warning_stacklevel)
+
+
 def setup_integrations(
     integrations: "Sequence[Integration]",
     with_defaults: bool = True,
@@ -198,6 +262,10 @@ def setup_integrations(
     Users can override this behavior by:
       - Explicitly providing an integration in the `integrations=[]` list, or
       - Disabling the higher-level integration via the `disabled_integrations` option.
+
+    Integration installation is process-global and idempotent: a successful
+    `setup_once()` is never run twice. Failures do not prevent other
+    integrations or the SDK from initializing and are retried on the next call.
     """
     integrations = dict(
         (integration.identifier, integration) for integration in integrations or ()
@@ -221,7 +289,22 @@ def setup_integrations(
             with_auto_enabling_integrations
         ):
             if integration_cls.identifier not in integrations:
-                instance = integration_cls()
+                try:
+                    instance = integration_cls()
+                except Exception as e:
+                    with _installer_lock:
+                        _failed_integrations[integration_cls.identifier] = e
+                        _set_integration_status(
+                            integration_cls.identifier,
+                            _INSTALLATION_STATUS_FAILED,
+                        )
+                    _report_integration_failure(
+                        integration_cls.identifier,
+                        e,
+                        True,
+                        warning_stacklevel=2,
+                    )
+                    continue
                 integrations[instance.identifier] = instance
                 used_as_default_integration.add(instance.identifier)
 
@@ -247,39 +330,48 @@ def setup_integrations(
                                 )
 
     for identifier, integration in integrations.items():
+        if type(integration) in disabled_integrations:
+            logger.debug("Ignoring integration %s", identifier)
+            continue
+
         with _installer_lock:
-            if identifier not in _processed_integrations:
-                if type(integration) in disabled_integrations:
-                    logger.debug("Ignoring integration %s", identifier)
-                else:
-                    logger.debug(
-                        "Setting up previously not enabled integration %s", identifier
-                    )
-                    try:
-                        type(integration).setup_once()
-                        integration.setup_once_with_options(options)
-                    except DidNotEnable as e:
-                        if identifier not in used_as_default_integration:
-                            raise
+            if identifier in _installed_integrations:
+                _set_integration_status(identifier, _INSTALLATION_STATUS_INSTALLED)
+                logger.debug("Integration %s is already enabled", identifier)
+                continue
 
-                        logger.debug(
-                            "Did not enable default integration %s: %s", identifier, e
-                        )
-                    else:
-                        _installed_integrations.add(identifier)
+            logger.debug(
+                "Setting up previously not enabled integration %s", identifier
+            )
+            try:
+                type(integration).setup_once()
+                integration.setup_once_with_options(options)
+            except Exception as e:
+                _failed_integrations[identifier] = e
+                _set_integration_status(identifier, _INSTALLATION_STATUS_FAILED)
+                error = e
+            else:
+                _set_integration_status(identifier, _INSTALLATION_STATUS_INSTALLED)
+                error = None
 
-                _processed_integrations.add(identifier)
+        if error is not None:
+            _report_integration_failure(
+                identifier, error, identifier in used_as_default_integration
+            )
 
-    integrations = {
+    with _installer_lock:
+        installed_integrations = set(_installed_integrations)
+    enabled_integrations = {
         identifier: integration
         for identifier, integration in integrations.items()
-        if identifier in _installed_integrations
+        if identifier in installed_integrations
+        and type(integration) not in disabled_integrations
     }
 
-    for identifier in integrations:
+    for identifier in enabled_integrations:
         logger.debug("Enabling integration %s", identifier)
 
-    return integrations
+    return enabled_integrations
 
 
 def _check_minimum_version(
@@ -307,9 +399,14 @@ class DidNotEnable(Exception):  # noqa: N818
     The integration could not be enabled due to a trivial user error like
     `flask` not being installed for the `FlaskIntegration`.
 
-    This exception is silently swallowed for default integrations, but reraised
-    for explicitly enabled integrations.
+    This exception is silently swallowed for default integrations. For
+    explicitly enabled integrations it skips the integration without aborting
+    SDK initialization and emits an ``IntegrationWarning``.
     """
+
+
+class IntegrationWarning(RuntimeWarning):
+    """Warning emitted when an explicitly configured integration cannot load."""
 
 
 class Integration(ABC):

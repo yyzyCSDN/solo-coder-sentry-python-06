@@ -27,8 +27,13 @@ from sentry_sdk.client import Client
 from sentry_sdk.integrations import (
     _AUTO_ENABLING_INTEGRATIONS,
     _DEFAULT_INTEGRATIONS,
+    _failed_integrations,
+    _installed_integrations,
+    _integrations_status,
+    _processed_integrations,
     DidNotEnable,
     Integration,
+    IntegrationWarning,
     setup_integrations,
 )
 from sentry_sdk.integrations.logging import LoggingIntegration
@@ -111,6 +116,34 @@ def test_auto_enabling_integrations_catches_import_error(sentry_init, caplog):
             )
             for record in caplog.records
         ), "Problem with checking auto enabling {}".format(import_string)
+
+
+def test_auto_enabling_integration_unexpected_import_error_is_isolated(
+    monkeypatch,
+    caplog,
+):
+    import sentry_sdk.integrations as integrations_module
+
+    def import_module(name):
+        if name == "sentry_sdk.integrations.aiohttp":
+            raise RuntimeError("broken module")
+        return importlib.import_module(name)
+
+    monkeypatch.setattr("importlib.import_module", import_module)
+    caplog.set_level(logging.WARNING)
+
+    with pytest.warns(IntegrationWarning, match="aiohttp.AioHttpIntegration"):
+        classes = list(
+            integrations_module.iter_default_integrations(
+                with_auto_enabling_integrations=True
+            )
+        )
+
+    assert all(cls.identifier != "aiohttp" for cls in classes)
+    assert any(
+        "aiohttp.AioHttpIntegration" in record.message
+        for record in caplog.records
+    )
 
 
 def test_generic_mechanism(sentry_init, capture_events):
@@ -977,11 +1010,204 @@ def test_functions_to_trace_with_class(sentry_init, capture_events):
 
 
 def test_multiple_setup_integrations_calls():
-    first_call_return = setup_integrations([NoOpIntegration()], with_defaults=False)
+    first_integration = NoOpIntegration()
+    first_call_return = setup_integrations([first_integration], with_defaults=False)
     assert first_call_return == {NoOpIntegration.identifier: NoOpIntegration()}
+    assert first_call_return[NoOpIntegration.identifier] is first_integration
 
-    second_call_return = setup_integrations([NoOpIntegration()], with_defaults=False)
+    second_integration = NoOpIntegration()
+    second_call_return = setup_integrations(
+        [second_integration], with_defaults=False
+    )
     assert second_call_return == {NoOpIntegration.identifier: NoOpIntegration()}
+    assert second_call_return[NoOpIntegration.identifier] is second_integration
+
+
+def test_global_setup_happens_only_once(reset_test_integrations):
+    WorkingIntegration.setup_count = 0
+    _installed_integrations.discard(WorkingIntegration.identifier)
+    _processed_integrations.discard(WorkingIntegration.identifier)
+    _integrations_status.pop(WorkingIntegration.identifier, None)
+
+    setup_integrations([WorkingIntegration()], with_defaults=False)
+    setup_integrations([WorkingIntegration()], with_defaults=False)
+
+    assert WorkingIntegration.setup_count == 1
+    assert _integrations_status[WorkingIntegration.identifier] == "installed"
+
+
+class FailingIntegration(Integration):
+    identifier = "failing-test-integration"
+
+    @staticmethod
+    def setup_once() -> None:
+        raise DidNotEnable("missing test dependency")
+
+
+class BrokenIntegration(Integration):
+    identifier = "broken-test-integration"
+
+    @staticmethod
+    def setup_once() -> None:
+        raise RuntimeError("unexpected test failure")
+
+
+class WorkingIntegration(Integration):
+    identifier = "working-test-integration"
+    setup_count = 0
+
+    @staticmethod
+    def setup_once() -> None:
+        WorkingIntegration.setup_count += 1
+
+
+class RecoverableIntegration(Integration):
+    identifier = "recoverable-test-integration"
+    should_fail = True
+
+    @staticmethod
+    def setup_once() -> None:
+        if RecoverableIntegration.should_fail:
+            raise DidNotEnable("temporarily unavailable")
+
+
+class MissingDefaultIntegration(Integration):
+    identifier = "missing-default-test-integration"
+
+    @staticmethod
+    def setup_once() -> None:
+        raise DidNotEnable("default dependency is unavailable")
+
+
+class BrokenDefaultIntegration(Integration):
+    identifier = "broken-default-test-integration"
+
+    @staticmethod
+    def setup_once() -> None:
+        raise RuntimeError("default dependency failed unexpectedly")
+
+
+@pytest.fixture
+def reset_test_integrations():
+    identifiers = {
+        FailingIntegration.identifier,
+        BrokenIntegration.identifier,
+        WorkingIntegration.identifier,
+        RecoverableIntegration.identifier,
+        MissingDefaultIntegration.identifier,
+        BrokenDefaultIntegration.identifier,
+    }
+
+    yield
+
+    RecoverableIntegration.should_fail = True
+    WorkingIntegration.setup_count = 0
+    for identifier in identifiers:
+        _processed_integrations.discard(identifier)
+        _installed_integrations.discard(identifier)
+        _failed_integrations.pop(identifier, None)
+        _integrations_status.pop(identifier, None)
+
+
+def test_explicit_did_not_enable_does_not_break_other_integrations(
+    reset_test_integrations,
+):
+    with pytest.warns(IntegrationWarning, match="failing-test-integration"):
+        enabled = setup_integrations(
+            [FailingIntegration(), WorkingIntegration()],
+            with_defaults=False,
+        )
+
+    assert enabled == {WorkingIntegration.identifier: WorkingIntegration()}
+    assert FailingIntegration.identifier in _failed_integrations
+    assert _integrations_status[FailingIntegration.identifier] == "failed"
+    assert WorkingIntegration.identifier in _installed_integrations
+
+
+def test_unexpected_integration_error_does_not_break_other_integrations(
+    caplog,
+    reset_test_integrations,
+):
+    with pytest.warns(IntegrationWarning, match="broken-test-integration"):
+        enabled = setup_integrations(
+            [BrokenIntegration(), WorkingIntegration()],
+            with_defaults=False,
+        )
+
+    assert enabled == {WorkingIntegration.identifier: WorkingIntegration()}
+    assert isinstance(
+        _failed_integrations[BrokenIntegration.identifier], RuntimeError
+    )
+    assert any(
+        record.message.startswith(
+            "Did not enable broken-test-integration integration due to an error"
+        )
+        for record in caplog.records
+    )
+
+
+def test_failed_integration_is_retried_on_next_setup(reset_test_integrations):
+    with pytest.warns(IntegrationWarning, match="recoverable-test-integration"):
+        assert setup_integrations(
+            [RecoverableIntegration()], with_defaults=False
+        ) == {}
+
+    RecoverableIntegration.should_fail = False
+    enabled = setup_integrations([RecoverableIntegration()], with_defaults=False)
+
+    assert enabled == {
+        RecoverableIntegration.identifier: RecoverableIntegration()
+    }
+    assert RecoverableIntegration.identifier not in _failed_integrations
+    assert RecoverableIntegration.identifier in _installed_integrations
+
+
+def test_missing_default_integration_is_skipped_silently(
+    monkeypatch, caplog, reset_test_integrations
+):
+    monkeypatch.setattr(
+        "sentry_sdk.integrations.iter_default_integrations",
+        lambda with_auto_enabling_integrations: iter([MissingDefaultIntegration]),
+    )
+    caplog.set_level(logging.DEBUG)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        enabled = setup_integrations([], with_defaults=True)
+
+    assert enabled == {}
+    assert MissingDefaultIntegration.identifier in _failed_integrations
+    assert any(
+        record.message.startswith(
+            "Did not enable default integration missing-default-test-integration"
+        )
+        for record in caplog.records
+    )
+
+
+def test_default_integration_failure_does_not_break_sdk(
+    monkeypatch, caplog, reset_test_integrations
+):
+    monkeypatch.setattr(
+        "sentry_sdk.integrations.iter_default_integrations",
+        lambda with_auto_enabling_integrations: iter([BrokenDefaultIntegration]),
+    )
+    caplog.set_level(logging.WARNING)
+
+    with pytest.warns(
+        IntegrationWarning, match="broken-default-test-integration"
+    ):
+        enabled = setup_integrations([], with_defaults=True)
+
+    assert enabled == {}
+    assert BrokenDefaultIntegration.identifier in _failed_integrations
+    assert any(
+        record.message.startswith(
+            "Did not enable broken-default-test-integration integration "
+            "due to an error"
+        )
+        for record in caplog.records
+    )
 
 
 class TracingTestClass:
